@@ -1,1 +1,1 @@
-# alias-manager
+# Alias Manager
