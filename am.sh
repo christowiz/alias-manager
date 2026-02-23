@@ -208,12 +208,14 @@ function am_add() {
     fi
     
     # Check for existing definitions
-    local exists_in_aliases=$(check_alias_exists "$name")
-    local exists_in_functions=$(check_function_exists "$name")
-    
+    local exists_in_aliases=false
+    local exists_in_functions=false
+    check_alias_exists "$name" && exists_in_aliases=true
+    check_function_exists "$name" && exists_in_functions=true
+
     # If --force is used, remove existing duplicates before adding
     if [[ "$force" == true ]]; then
-        if [[ "$exists_in_aliases" == "true" ]]; then
+        if $exists_in_aliases; then
             if [[ "$dry_run" == true ]]; then
                 echo -e "${CYAN}[DRY RUN]${NC} Would remove existing alias '$name'"
             else
@@ -221,7 +223,7 @@ function am_add() {
                 am_remove --force -a "$name" >/dev/null 2>&1
             fi
         fi
-        if [[ "$exists_in_functions" == "true" ]]; then
+        if $exists_in_functions; then
             if [[ "$dry_run" == true ]]; then
                 echo -e "${CYAN}[DRY RUN]${NC} Would remove existing function '$name'"
             else
@@ -229,12 +231,12 @@ function am_add() {
                 am_remove --force -f "$name" >/dev/null 2>&1
             fi
         fi
-    elif [[ "$exists_in_aliases" == "true" || "$exists_in_functions" == "true" ]]; then
+    elif $exists_in_aliases || $exists_in_functions; then
         echo -e "${YELLOW}Warning:${NC} Name '$name' already exists:"
-        if [[ "$exists_in_aliases" == "true" ]]; then
+        if $exists_in_aliases; then
             echo -e "  ${BLUE}Alias:${NC} $(get_alias_definition "$name")"
         fi
-        if [[ "$exists_in_functions" == "true" ]]; then
+        if $exists_in_functions; then
             echo -e "  ${PURPLE}Function:${NC} $(get_function_summary "$name")"
         fi
         echo ""
@@ -281,7 +283,7 @@ function am_add() {
 function add_alias() {
     local name="$1"
     local command="$2"
-    
+
     if [[ -z "$command" ]]; then
         read_with_prompt "Enter command for alias '$name': " command
         if [[ -z "$command" ]]; then
@@ -289,109 +291,16 @@ function add_alias() {
             return 1
         fi
     fi
-    
-    # Escape single quotes in command
+
     command=$(echo "$command" | sed "s/'/'\\\\''/g")
-    
-    # Create directory and file if needed
+
     mkdir -p "$(dirname "$ALIASES_FILE")"
     touch "$ALIASES_FILE"
-    
-    # Acquire lock before writing
-    if ! acquire_aliases_lock; then
+
+    if ! atomic_append_to_file "$ALIASES_FILE" acquire_aliases_lock release_aliases_lock "alias" _append_alias_content "$name" "$command"; then
         return 1
     fi
-    
-    # Check disk space before writing (need space for backup + new content)
-    if ! check_disk_space "$ALIASES_FILE" 2048; then
-        release_aliases_lock
-        return 1
-    fi
-    
-    # Create backup before modifying file (with rotation)
-    if [[ -f "$ALIASES_FILE" ]] && [[ -s "$ALIASES_FILE" ]]; then
-        if ! create_backup_with_rotation "$ALIASES_FILE"; then
-            release_aliases_lock
-            echo -e "${RED}Error:${NC} Failed to create backup"
-            return 1
-        fi
-    fi
-    
-    # Create temporary file for atomic write
-    local temp_file=$(mktemp "$(dirname "$ALIASES_FILE")/aliases.XXXXXX" 2>/dev/null || mktemp)
-    if [[ ! -f "$temp_file" ]]; then
-        release_aliases_lock
-        echo -e "${RED}Error:${NC} Failed to create temporary file"
-        return 1
-    fi
-    # Register temp file for automatic cleanup
-    register_temp_file "$temp_file"
-    
-    # Copy existing content to temp file (if file exists)
-    if [[ -f "$ALIASES_FILE" ]] && [[ -s "$ALIASES_FILE" ]]; then
-        if ! cp "$ALIASES_FILE" "$temp_file" 2>&1; then
-            local copy_error=$?
-            release_aliases_lock
-            unregister_temp_file "$temp_file"
-            rm -f "$temp_file"
-            echo -e "${RED}Error:${NC} Failed to copy existing aliases to temporary file"
-            echo "  Exit code: $copy_error"
-            return 1
-        fi
-    fi
-    
-    # Append new alias to temp file with error checking
-    if ! echo "alias $name='$command'" >> "$temp_file" 2>&1; then
-        local write_error=$?
-        release_aliases_lock
-        unregister_temp_file "$temp_file"
-        rm -f "$temp_file"
-        
-        # Provide specific error messages based on common failure scenarios
-        if [[ ! -w "$(dirname "$ALIASES_FILE")" ]] 2>/dev/null && [[ -d "$(dirname "$ALIASES_FILE")" ]]; then
-            echo -e "${RED}Error:${NC} Permission denied - cannot write to directory: $(dirname "$ALIASES_FILE")"
-        elif [[ -f "$temp_file" ]] && [[ ! -w "$temp_file" ]] 2>/dev/null; then
-            echo -e "${RED}Error:${NC} Permission denied - cannot write to temporary file"
-        else
-            echo -e "${RED}Error:${NC} Failed to write alias to temporary file"
-            echo "  This may be due to: disk full, permission issues, or filesystem errors"
-            echo "  Exit code: $write_error"
-        fi
-        return 1
-    fi
-    
-    # Validate temp file syntax before atomic replacement
-    if ! bash -n "$temp_file" 2>/dev/null; then
-        release_aliases_lock
-        unregister_temp_file "$temp_file"
-        rm -f "$temp_file"
-        echo -e "${RED}Error:${NC} Syntax error in alias definition - operation aborted"
-        return 1
-    fi
-    
-    # Atomically replace original file with temp file
-    if ! mv "$temp_file" "$ALIASES_FILE" 2>&1; then
-        local mv_error=$?
-        release_aliases_lock
-        unregister_temp_file "$temp_file"
-        rm -f "$temp_file"
-        echo -e "${RED}Error:${NC} Failed to atomically replace aliases file"
-        echo "  This may be due to: disk full, permission issues, or filesystem errors"
-        echo "  Exit code: $mv_error"
-        # Restore from backup if atomic replace failed
-        if [[ -f "${ALIASES_FILE}.bak" ]]; then
-            mv "${ALIASES_FILE}.bak" "$ALIASES_FILE" 2>/dev/null
-            echo "  Original file restored from backup"
-        fi
-        return 1
-    fi
-    # Unregister temp file since it was successfully moved
-    unregister_temp_file "$temp_file"
-    
-    # Release lock
-    release_aliases_lock
-    
-    # Validate and source the file
+
     if ! bash -n "$ALIASES_FILE" 2>/dev/null; then
         echo -e "${RED}Error:${NC} Syntax error detected in aliases file after write"
         echo "  File may be corrupted. Check: $ALIASES_FILE"
@@ -420,115 +329,16 @@ function add_function() {
     local name="$1"
     local command="$2"
     
-    # Create directory and file if needed
     mkdir -p "$(dirname "$FUNCTIONS_FILE")"
     touch "$FUNCTIONS_FILE"
-    
+
     if [[ -n "$command" ]]; then
-        # Simple one-liner function
-        # Acquire lock before writing
-        if ! acquire_functions_lock; then
+        if ! atomic_append_to_file "$FUNCTIONS_FILE" acquire_functions_lock release_functions_lock "function" _append_function_oneliner_content "$name" "$command"; then
             return 1
         fi
-        
-        # Check disk space before writing (need space for backup + new content)
-        if ! check_disk_space "$FUNCTIONS_FILE" 2048; then
-            release_functions_lock
-            return 1
-        fi
-        
-        # Create backup before modifying file (with rotation)
-        if [[ -f "$FUNCTIONS_FILE" ]] && [[ -s "$FUNCTIONS_FILE" ]]; then
-            if ! create_backup_with_rotation "$FUNCTIONS_FILE"; then
-                release_functions_lock
-                echo -e "${RED}Error:${NC} Failed to create backup"
-                return 1
-            fi
-        fi
-        
-        # Create temporary file for atomic write
-        local temp_file=$(mktemp "$(dirname "$FUNCTIONS_FILE")/functions.XXXXXX" 2>/dev/null || mktemp)
-        if [[ ! -f "$temp_file" ]]; then
-            release_functions_lock
-            echo -e "${RED}Error:${NC} Failed to create temporary file"
-            return 1
-        fi
-        # Register temp file for automatic cleanup
-        register_temp_file "$temp_file"
-        
-        # Copy existing content to temp file (if file exists)
-        if [[ -f "$FUNCTIONS_FILE" ]] && [[ -s "$FUNCTIONS_FILE" ]]; then
-            if ! cp "$FUNCTIONS_FILE" "$temp_file" 2>&1; then
-                local copy_error=$?
-                release_functions_lock
-                unregister_temp_file "$temp_file"
-                rm -f "$temp_file"
-                echo -e "${RED}Error:${NC} Failed to copy existing functions to temporary file"
-                echo "  Exit code: $copy_error"
-                return 1
-            fi
-        fi
-        
-        # Append new function to temp file with error checking
-        if ! {
-            echo ""
-            echo "function $name() {"
-            echo "    $command"
-            echo "}"
-        } >> "$temp_file" 2>&1; then
-            local write_error=$?
-            release_functions_lock
-            unregister_temp_file "$temp_file"
-            rm -f "$temp_file"
-            
-            # Provide specific error messages based on common failure scenarios
-            if [[ ! -w "$(dirname "$FUNCTIONS_FILE")" ]] 2>/dev/null && [[ -d "$(dirname "$FUNCTIONS_FILE")" ]]; then
-                echo -e "${RED}Error:${NC} Permission denied - cannot write to directory: $(dirname "$FUNCTIONS_FILE")"
-            elif [[ -f "$temp_file" ]] && [[ ! -w "$temp_file" ]] 2>/dev/null; then
-                echo -e "${RED}Error:${NC} Permission denied - cannot write to temporary file"
-            else
-                echo -e "${RED}Error:${NC} Failed to write function to temporary file"
-                echo "  This may be due to: disk full, permission issues, or filesystem errors"
-                echo "  Exit code: $write_error"
-            fi
-            return 1
-        fi
-        
-        # Validate temp file syntax before atomic replacement
-        if ! bash -n "$temp_file" 2>/dev/null; then
-            release_functions_lock
-            unregister_temp_file "$temp_file"
-            rm -f "$temp_file"
-            echo -e "${RED}Error:${NC} Syntax error in function definition - operation aborted"
-            return 1
-        fi
-        
-        # Atomically replace original file with temp file
-        if ! mv "$temp_file" "$FUNCTIONS_FILE" 2>&1; then
-            local mv_error=$?
-            release_functions_lock
-            unregister_temp_file "$temp_file"
-            rm -f "$temp_file"
-            echo -e "${RED}Error:${NC} Failed to atomically replace functions file"
-            echo "  This may be due to: disk full, permission issues, or filesystem errors"
-            echo "  Exit code: $mv_error"
-            # Restore from backup if atomic replace failed
-            if [[ -f "${FUNCTIONS_FILE}.bak" ]]; then
-                mv "${FUNCTIONS_FILE}.bak" "$FUNCTIONS_FILE" 2>/dev/null
-                echo "  Original file restored from backup"
-            fi
-            return 1
-        fi
-        # Unregister temp file since it was successfully moved
-        unregister_temp_file "$temp_file"
-        
-        # Release lock
-        release_functions_lock
         echo -e "${GREEN}✓${NC} Function added: $name"
     else
-        # Open editor for complex function
         local temp_file=$(mktemp)
-        # Register temp file for automatic cleanup
         register_temp_file "$temp_file"
         cat > "$temp_file" << EOF
 function $name() {
@@ -536,19 +346,16 @@ function $name() {
     echo "Function $name not implemented"
 }
 EOF
-        
-        # Store original checksum
+
         local original_checksum=""
         if command -v md5sum >/dev/null 2>&1; then
             original_checksum=$(md5sum "$temp_file" | cut -d' ' -f1)
         elif command -v md5 >/dev/null 2>&1; then
             original_checksum=$(md5 -q "$temp_file")
         fi
-        
-        # Open editor
+
         $EDITOR "$temp_file"
-        
-        # Check if file was modified
+
         local new_checksum=""
         if command -v md5sum >/dev/null 2>&1; then
             new_checksum=$(md5sum "$temp_file" | cut -d' ' -f1)
@@ -557,125 +364,18 @@ EOF
         fi
         
         if [[ "$original_checksum" != "$new_checksum" ]] && [[ -s "$temp_file" ]]; then
-            # Validate basic syntax
             if bash -n "$temp_file" 2>/dev/null; then
-                # Acquire lock before writing
-                if ! acquire_functions_lock; then
+                if ! atomic_append_to_file "$FUNCTIONS_FILE" acquire_functions_lock release_functions_lock "function" _append_function_from_file "$temp_file"; then
                     unregister_temp_file "$temp_file"
                     rm -f "$temp_file"
                     return 1
                 fi
-                
-                # Check disk space before writing (need space for backup + new content)
-                if ! check_disk_space "$FUNCTIONS_FILE" 2048; then
-                    release_functions_lock
-                    unregister_temp_file "$temp_file"
-                    rm -f "$temp_file"
-                    return 1
-                fi
-                
-                # Create backup before modifying file (with rotation)
-                if [[ -f "$FUNCTIONS_FILE" ]] && [[ -s "$FUNCTIONS_FILE" ]]; then
-                    if ! create_backup_with_rotation "$FUNCTIONS_FILE"; then
-                        release_functions_lock
-                        unregister_temp_file "$temp_file"
-                        rm -f "$temp_file"
-                        echo -e "${RED}Error:${NC} Failed to create backup"
-                        return 1
-                    fi
-                fi
-                
-                # Create temporary file for atomic write
-                local atomic_temp_file=$(mktemp "$(dirname "$FUNCTIONS_FILE")/functions.XXXXXX" 2>/dev/null || mktemp)
-                if [[ ! -f "$atomic_temp_file" ]]; then
-                    release_functions_lock
-                    unregister_temp_file "$temp_file"
-                    rm -f "$temp_file"
-                    echo -e "${RED}Error:${NC} Failed to create temporary file for atomic write"
-                    return 1
-                fi
-                # Register atomic temp file for automatic cleanup
-                register_temp_file "$atomic_temp_file"
-                
-                # Copy existing content to atomic temp file (if file exists)
-                if [[ -f "$FUNCTIONS_FILE" ]] && [[ -s "$FUNCTIONS_FILE" ]]; then
-                    if ! cp "$FUNCTIONS_FILE" "$atomic_temp_file" 2>&1; then
-                        local copy_error=$?
-                        release_functions_lock
-                        unregister_temp_file "$temp_file"
-                        unregister_temp_file "$atomic_temp_file"
-                        rm -f "$temp_file" "$atomic_temp_file"
-                        echo -e "${RED}Error:${NC} Failed to copy existing functions to temporary file"
-                        echo "  Exit code: $copy_error"
-                        return 1
-                    fi
-                fi
-                
-                # Append new function to atomic temp file with error checking
-                if ! {
-                    echo ""
-                    cat "$temp_file"
-                } >> "$atomic_temp_file" 2>&1; then
-                    local write_error=$?
-                    release_functions_lock
-                    unregister_temp_file "$temp_file"
-                    unregister_temp_file "$atomic_temp_file"
-                    rm -f "$temp_file" "$atomic_temp_file"
-                    
-                    # Provide specific error messages based on common failure scenarios
-                    if [[ ! -w "$(dirname "$FUNCTIONS_FILE")" ]] 2>/dev/null && [[ -d "$(dirname "$FUNCTIONS_FILE")" ]]; then
-                        echo -e "${RED}Error:${NC} Permission denied - cannot write to directory: $(dirname "$FUNCTIONS_FILE")"
-                    elif [[ -f "$atomic_temp_file" ]] && [[ ! -w "$atomic_temp_file" ]] 2>/dev/null; then
-                        echo -e "${RED}Error:${NC} Permission denied - cannot write to temporary file"
-                    else
-                        echo -e "${RED}Error:${NC} Failed to write function to temporary file"
-                        echo "  This may be due to: disk full, permission issues, or filesystem errors"
-                        echo "  Exit code: $write_error"
-                    fi
-                    return 1
-                fi
-                
-                # Validate atomic temp file syntax before atomic replacement
-                if ! bash -n "$atomic_temp_file" 2>/dev/null; then
-                    release_functions_lock
-                    unregister_temp_file "$temp_file"
-                    unregister_temp_file "$atomic_temp_file"
-                    rm -f "$temp_file" "$atomic_temp_file"
-                    echo -e "${RED}Error:${NC} Syntax error in function definition - operation aborted"
-                    return 1
-                fi
-                
-                # Atomically replace original file with atomic temp file
-                if ! mv "$atomic_temp_file" "$FUNCTIONS_FILE" 2>&1; then
-                    local mv_error=$?
-                    release_functions_lock
-                    unregister_temp_file "$temp_file"
-                    unregister_temp_file "$atomic_temp_file"
-                    rm -f "$temp_file" "$atomic_temp_file"
-                    echo -e "${RED}Error:${NC} Failed to atomically replace functions file"
-                    echo "  This may be due to: disk full, permission issues, or filesystem errors"
-                    echo "  Exit code: $mv_error"
-                    # Restore from backup if atomic replace failed
-                    if [[ -f "${FUNCTIONS_FILE}.bak" ]]; then
-                        mv "${FUNCTIONS_FILE}.bak" "$FUNCTIONS_FILE" 2>/dev/null
-                        echo "  Original file restored from backup"
-                    fi
-                    return 1
-                fi
-                # Unregister atomic temp file since it was successfully moved
-                unregister_temp_file "$atomic_temp_file"
-                
-                # Release lock
-                release_functions_lock
                 echo -e "${GREEN}✓${NC} Function added: $name"
-                
-                # Show preview
                 echo -e "${CYAN}Preview:${NC}"
-                cat "$temp_file" | head -10
+                head -10 "$temp_file"
                 if [[ $(wc -l < "$temp_file") -gt 10 ]]; then
                     echo "..."
                 fi
-                # Unregister and remove editor temp file
                 unregister_temp_file "$temp_file"
                 rm -f "$temp_file"
             else
@@ -691,8 +391,7 @@ EOF
             rm -f "$temp_file"
         fi
     fi
-    
-    # Validate and source the file
+
     if ! bash -n "$FUNCTIONS_FILE" 2>/dev/null; then
         echo -e "${RED}Error:${NC} Syntax error detected in functions file after write"
         echo "  File may be corrupted. Check: $FUNCTIONS_FILE"
@@ -1404,15 +1103,15 @@ function am_edit() {
     local type=""
     
     # Determine type
-    if check_alias_exists "$name" | grep -q "true"; then
+    if check_alias_exists "$name"; then
         type="alias"
-    elif check_function_exists "$name" | grep -q "true"; then
+    elif check_function_exists "$name"; then
         type="function"
     else
         echo -e "${RED}Error:${NC} '$name' not found as alias or function"
         return 1
     fi
-    
+
     if [[ "$type" == "alias" ]]; then
         # Get current alias definition
         local current_def=$(get_alias_definition "$name")
@@ -1421,12 +1120,10 @@ function am_edit() {
             return 1
         fi
         
-        # Create temp file with current definition
         local temp_file=$(mktemp)
         echo "$current_def" > "$temp_file"
         register_temp_file "$temp_file"
         
-        # Open in editor
         if command -v "$EDITOR" >/dev/null 2>&1; then
             "$EDITOR" "$temp_file"
         else
@@ -1441,7 +1138,6 @@ function am_edit() {
         unregister_temp_file "$temp_file"
         rm -f "$temp_file"
         
-        # Validate and update
         if [[ -z "$edited_def" ]]; then
             echo -e "${RED}Error:${NC} Empty definition"
             return 1
@@ -1461,7 +1157,6 @@ function am_edit() {
             return 1
         fi
         
-        # Open functions file in editor
         if command -v "$EDITOR" >/dev/null 2>&1; then
             echo "Opening functions file. Please locate and edit function '$name'"
             "$EDITOR" "$FUNCTIONS_FILE"
@@ -1499,11 +1194,11 @@ function am_update() {
     # Determine type
     local type=""
     local type_flag=""
-    
-    if check_alias_exists "$name" | grep -q "true"; then
+
+    if check_alias_exists "$name"; then
         type="alias"
         type_flag="-a"
-    elif check_function_exists "$name" | grep -q "true"; then
+    elif check_function_exists "$name"; then
         type="function"
         type_flag="-f"
     else
@@ -1511,7 +1206,7 @@ function am_update() {
         echo "Use 'am add' to create a new alias or function"
         return 1
     fi
-    
+
     # Remove old and add new with force
     am_remove --force $type_flag "$name" >/dev/null 2>&1
     am_add $type_flag "$name" "$command"
@@ -1560,18 +1255,19 @@ function am_remove() {
         return 1
     fi
     
-    # Check where it exists
-    local exists_in_aliases=$(check_alias_exists "$name")
-    local exists_in_functions=$(check_function_exists "$name")
-    
-     # If it doesn't exist anywhere
-    if [[ "$exists_in_aliases" != "true" && "$exists_in_functions" != "true" ]]; then
+    local exists_in_aliases=false
+    local exists_in_functions=false
+    check_alias_exists "$name" && exists_in_aliases=true
+    check_function_exists "$name" && exists_in_functions=true
+
+    # If it doesn't exist anywhere
+    if ! $exists_in_aliases && ! $exists_in_functions; then
         echo -e "${RED}Error:${NC} No alias or function named '$name' found"
         return 1
     fi
     
     # Handle duplicates
-    if [[ "$exists_in_aliases" == "true" && "$exists_in_functions" == "true" && -z "$type" ]]; then
+    if $exists_in_aliases && $exists_in_functions && [[ -z "$type" ]]; then
         echo -e "${YELLOW}Warning:${NC} Found both alias and function named '$name'"
         echo -e "  ${BLUE}Alias:${NC} $(get_alias_definition "$name")"
         echo -e "  ${PURPLE}Function:${NC} $(get_function_summary "$name")"
@@ -1596,7 +1292,7 @@ function am_remove() {
         local prompt=""
         if [[ "$type" == "both" ]]; then
             prompt="Remove both alias and function '$name'?"
-        elif [[ "$type" == "alias" || "$exists_in_aliases" == "true" ]]; then
+        elif [[ "$type" == "alias" ]] || $exists_in_aliases; then
             prompt="Remove alias '$name'?"
         else
             prompt="Remove function '$name'?"
@@ -1617,11 +1313,11 @@ function am_remove() {
     local function_backup=""
     
     # Determine what needs to be removed
-    if [[ "$type" == "alias" || "$type" == "both" || (-z "$type" && "$exists_in_aliases" == "true") ]]; then
+    if [[ "$type" == "alias" || "$type" == "both" ]] || { [[ -z "$type" ]] && $exists_in_aliases; }; then
         remove_alias_needed=true
     fi
-    
-    if [[ "$type" == "function" || "$type" == "both" || (-z "$type" && "$exists_in_functions" == "true") ]]; then
+
+    if [[ "$type" == "function" || "$type" == "both" ]] || { [[ -z "$type" ]] && $exists_in_functions; }; then
         remove_function_needed=true
     fi
     
@@ -1690,26 +1386,21 @@ function remove_alias() {
         return 1
     fi
 
-    # Acquire lock before modifying
     if ! acquire_aliases_lock; then
         return 1
     fi
 
-    # Check disk space before modifying (need space for backup + temp file)
     if ! check_disk_space "$ALIASES_FILE" 2048; then
         release_aliases_lock
         return 1
     fi
 
-    # Create backup with rotation
     if ! create_backup_with_rotation "$ALIASES_FILE"; then
         release_aliases_lock
         echo -e "${RED}Error:${NC} Failed to create backup"
         return 1
     fi
 
-    # Remove the alias using sed (more reliable than grep -v)
-    # Use sed to delete lines matching the pattern, handling empty files correctly
     local escaped_name=$(escape_regex_special "$name")
     if sed "/^alias $escaped_name=/d" "$ALIASES_FILE" > "$ALIASES_FILE.tmp" 2>/dev/null; then
         if mv "$ALIASES_FILE.tmp" "$ALIASES_FILE"; then
@@ -1741,47 +1432,39 @@ function remove_function() {
     if [[ ! -f "$FUNCTIONS_FILE" ]]; then
         return 1
     fi
-    
-    # Acquire lock before modifying
+
     if ! acquire_functions_lock; then
         return 1
     fi
-    
-    # Check disk space before modifying (need space for backup + temp file)
+
     if ! check_disk_space "$FUNCTIONS_FILE" 2048; then
         release_functions_lock
         return 1
     fi
-    
-    # Create backup with rotation
+
     if ! create_backup_with_rotation "$FUNCTIONS_FILE"; then
         release_functions_lock
         echo -e "${RED}Error:${NC} Failed to create backup"
         return 1
     fi
-    
-    # Create a temporary file
+
     local temp_file=$(mktemp)
     if [[ ! -f "$temp_file" ]]; then
         release_functions_lock
         echo -e "${RED}Error:${NC} Failed to create temporary file"
         return 1
     fi
-    # Register temp file for automatic cleanup
     register_temp_file "$temp_file"
-    
+
     local in_function=false
     local brace_count=0
     local write_failed=false
     local in_string=false
     local string_char=""
-    
-    # Escape function name for regex matching
+
     local escaped_name=$(escape_regex_special "$name")
-    
-    # Process file line by line to handle nested braces
+
     while IFS= read -r line || [[ -n "$line" ]]; do
-        # Check if we're starting the target function
         if [[ "$line" =~ ^[[:space:]]*(function[[:space:]]+${escaped_name}[[:space:]]*\(|${escaped_name}[[:space:]]*\()[[:space:]]*\{? ]]; then
             in_function=true
             brace_count=0
@@ -1844,7 +1527,6 @@ function remove_function() {
         fi
     done < "$FUNCTIONS_FILE"
     
-    # Check if write failed during processing
     if [[ "$write_failed" == true ]]; then
         release_functions_lock
         unregister_temp_file "$temp_file"
@@ -1863,8 +1545,7 @@ function remove_function() {
     
     # Replace original file
     if mv "$temp_file" "$FUNCTIONS_FILE"; then
-        # Unregister temp file since it was successfully moved
-        unregister_temp_file "$temp_file"
+    unregister_temp_file "$temp_file"
         release_functions_lock
         echo -e "${GREEN}✓${NC} Function '$name' removed"
         echo "Backup saved to: ${FUNCTIONS_FILE}.bak"
@@ -2266,14 +1947,10 @@ _functions_lock_fd=0
 function acquire_aliases_lock() {
     local lock_file="${ALIASES_FILE}.lock"
     local timeout=${1:-10}  # Default 10 second timeout
-    
-    # Create directory for lock file
+
     mkdir -p "$(dirname "$lock_file")"
-    
-    # Try to acquire exclusive lock with timeout
+
     if command -v flock >/dev/null 2>&1; then
-        # Use a fixed file descriptor (200 for aliases, 201 for functions)
-        # Open in append mode to avoid "cannot overwrite" errors
         if ! exec 200>>"$lock_file" 2>/dev/null; then
             echo -e "${RED}Error:${NC} Cannot open lock file: $lock_file"
             return 1
@@ -2296,7 +1973,6 @@ function acquire_aliases_lock() {
                 echo -e "${RED}Error:${NC} Cannot acquire lock for aliases file (timeout after ${timeout}s)"
                 return 1
             fi
-            # Check if lock file is stale (process no longer exists)
             if [[ -f "$lock_file" ]]; then
                 local lock_pid=$(cat "$lock_file" 2>/dev/null)
                 if [[ -n "$lock_pid" ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
@@ -2304,9 +1980,9 @@ function acquire_aliases_lock() {
                 fi
             fi
         done
-        _aliases_lock_fd=200  # Set to indicate lock is held
+        _aliases_lock_fd=200
     fi
-    
+
     return 0
 }
 
@@ -2332,14 +2008,10 @@ function release_aliases_lock() {
 function acquire_functions_lock() {
     local lock_file="${FUNCTIONS_FILE}.lock"
     local timeout=${1:-10}  # Default 10 second timeout
-    
-    # Create directory for lock file
+
     mkdir -p "$(dirname "$lock_file")"
-    
-    # Try to acquire exclusive lock with timeout
+
     if command -v flock >/dev/null 2>&1; then
-        # Use a fixed file descriptor (201 for functions)
-        # Open in append mode to avoid "cannot overwrite" errors
         if ! exec 201>>"$lock_file" 2>/dev/null; then
             echo -e "${RED}Error:${NC} Cannot open lock file: $lock_file"
             return 1
@@ -2362,7 +2034,6 @@ function acquire_functions_lock() {
                 echo -e "${RED}Error:${NC} Cannot acquire lock for functions file (timeout after ${timeout}s)"
                 return 1
             fi
-            # Check if lock file is stale (process no longer exists)
             if [[ -f "$lock_file" ]]; then
                 local lock_pid=$(cat "$lock_file" 2>/dev/null)
                 if [[ -n "$lock_pid" ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
@@ -2370,9 +2041,9 @@ function acquire_functions_lock() {
                 fi
             fi
         done
-        _functions_lock_fd=201  # Set to indicate lock is held
+        _functions_lock_fd=201
     fi
-    
+
     return 0
 }
 
@@ -2395,7 +2066,6 @@ function release_functions_lock() {
 }
 
 # Temporary file management functions
-# Register a temporary file for automatic cleanup
 function register_temp_file() {
     local temp_file="$1"
     if [[ -n "$temp_file" ]] && [[ -f "$temp_file" ]]; then
@@ -2403,7 +2073,6 @@ function register_temp_file() {
     fi
 }
 
-# Unregister a temporary file (when it's been successfully moved or deleted)
 function unregister_temp_file() {
     local temp_file="$1"
     if [[ -n "$temp_file" ]]; then
@@ -2454,8 +2123,7 @@ function create_backup_with_rotation() {
         # Rotate current backup
         mv "$backup_file" "$rotated_backup" 2>/dev/null
     fi
-    
-    # Create new backup
+
     if cp "$source_file" "$backup_file" 2>&1; then
         return 0
     else
@@ -2477,8 +2145,7 @@ function check_disk_space() {
     if [[ ! -d "$target_dir" ]]; then
         target_dir="$(dirname "$target_dir")"
     fi
-    
-    # Check available space (cross-platform)
+
     local available_kb=0
     if command -v df >/dev/null 2>&1; then
         # Try POSIX df first (works on most systems)
@@ -2513,11 +2180,123 @@ function check_disk_space() {
     return 0
 }
 
+function _append_alias_content() {
+    local temp_file="$1"
+    local name="$2"
+    local command="$3"
+    echo "alias $name='$command'" >> "$temp_file"
+}
+
+function _append_function_oneliner_content() {
+    local temp_file="$1"
+    local name="$2"
+    local command="$3"
+    { echo ""; echo "function $name() {"; echo "    $command"; echo "}"; } >> "$temp_file"
+}
+
+function _append_function_from_file() {
+    local temp_file="$1"
+    local content_file="$2"
+    { echo ""; cat "$content_file"; } >> "$temp_file"
+}
+
+function atomic_append_to_file() {
+    local target_file="$1"
+    local acquire_lock="$2"
+    local release_lock="$3"
+    local label="$4"
+    local append_fn="$5"
+    shift 5
+
+    if ! "$acquire_lock"; then
+        return 1
+    fi
+
+    if ! check_disk_space "$target_file" 2048; then
+        "$release_lock"
+        return 1
+    fi
+
+    if [[ -f "$target_file" ]] && [[ -s "$target_file" ]]; then
+        if ! create_backup_with_rotation "$target_file"; then
+            "$release_lock"
+            echo -e "${RED}Error:${NC} Failed to create backup"
+            return 1
+        fi
+    fi
+
+    local temp_file
+    temp_file=$(mktemp "$(dirname "$target_file")/${label}s.XXXXXX" 2>/dev/null || mktemp)
+    if [[ ! -f "$temp_file" ]]; then
+        "$release_lock"
+        echo -e "${RED}Error:${NC} Failed to create temporary file"
+        return 1
+    fi
+    register_temp_file "$temp_file"
+
+    if [[ -f "$target_file" ]] && [[ -s "$target_file" ]]; then
+        if ! cp "$target_file" "$temp_file" 2>&1; then
+            local copy_error=$?
+            "$release_lock"
+            unregister_temp_file "$temp_file"
+            rm -f "$temp_file"
+            echo -e "${RED}Error:${NC} Failed to copy existing ${label}s to temporary file"
+            echo "  Exit code: $copy_error"
+            return 1
+        fi
+    fi
+
+    if ! "$append_fn" "$temp_file" "$@"; then
+        local write_error=$?
+        "$release_lock"
+        unregister_temp_file "$temp_file"
+        rm -f "$temp_file"
+        local dir_path
+        dir_path="$(dirname "$target_file")"
+        if [[ ! -w "$dir_path" ]] 2>/dev/null && [[ -d "$dir_path" ]]; then
+            echo -e "${RED}Error:${NC} Permission denied - cannot write to directory: $dir_path"
+        elif [[ -f "$temp_file" ]] && [[ ! -w "$temp_file" ]] 2>/dev/null; then
+            echo -e "${RED}Error:${NC} Permission denied - cannot write to temporary file"
+        else
+            echo -e "${RED}Error:${NC} Failed to write ${label} to temporary file"
+            echo "  This may be due to: disk full, permission issues, or filesystem errors"
+            echo "  Exit code: $write_error"
+        fi
+        return 1
+    fi
+
+    if ! bash -n "$temp_file" 2>/dev/null; then
+        "$release_lock"
+        unregister_temp_file "$temp_file"
+        rm -f "$temp_file"
+        echo -e "${RED}Error:${NC} Syntax error in ${label} definition - operation aborted"
+        return 1
+    fi
+
+    if ! mv "$temp_file" "$target_file" 2>&1; then
+        local mv_error=$?
+        "$release_lock"
+        unregister_temp_file "$temp_file"
+        rm -f "$temp_file"
+        echo -e "${RED}Error:${NC} Failed to atomically replace ${label}s file"
+        echo "  This may be due to: disk full, permission issues, or filesystem errors"
+        echo "  Exit code: $mv_error"
+        if [[ -f "${target_file}.bak" ]]; then
+            mv "${target_file}.bak" "$target_file" 2>/dev/null
+            echo "  Original file restored from backup"
+        fi
+        return 1
+    fi
+    unregister_temp_file "$temp_file"
+    "$release_lock"
+    return 0
+}
+
 # Helper function to escape special regex characters in names
 function escape_regex_special() {
     local name="$1"
     # Escape special regex characters: . [ ] { } ( ) * + ? ^ $ | \
-    echo "$name" | sed 's/\./\\./g; s/\[/\\[/g; s/\]/\\]/g; s/{/\\{/g; s/}/\\}/g; s/(/\\(/g; s/)/\\)/g; s/\*/\\*/g; s/+/\\+/g; s/?/\\?/g; s/\^/\\^/g; s/\$/\\$/g; s/|/\\|/g; s/\\/\\\\/g'
+    echo "$name" | sed 's/\\/\\\\/g; s/\./\\./g; s/\[/\\[/g; s/\]/\\]/g; s/{/\\{/g; s/}/\\}/g; s/(/\\(/g; s/)/\\)/g; s/\*/\\*/g; s/+/\\+/g; s/?/\\?/g; s/\^/\\^/g; s/\$/\\$/g; s/|/\\|/g'
 }
 
 # Helper functions
@@ -2525,9 +2304,9 @@ function check_alias_exists() {
     local name="$1"
     local escaped_name=$(escape_regex_special "$name")
     if [[ -f "$ALIASES_FILE" ]] && grep -q "^alias $escaped_name=" "$ALIASES_FILE" 2>/dev/null; then
-        echo "true"
+        return 0
     else
-        echo "false"
+        return 1
     fi
 }
 
@@ -2535,9 +2314,9 @@ function check_function_exists() {
     local name="$1"
     local escaped_name=$(escape_regex_special "$name")
     if [[ -f "$FUNCTIONS_FILE" ]] && grep -qE "^[[:space:]]*(function[[:space:]]+${escaped_name}[[:space:]]*\(|${escaped_name}[[:space:]]*\()" "$FUNCTIONS_FILE" 2>/dev/null; then
-        echo "true"
+        return 0
     else
-        echo "false"
+        return 1
     fi
 }
 
